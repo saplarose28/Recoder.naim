@@ -11,6 +11,19 @@ E = os.environ.get
 TOKEN, CHAT = E("TG_TOKEN", ""), E("TG_CHAT", "")
 REPO, RUN = E("REPO", ""), E("RUN_ID", "local")
 URL = E("URL", "")
+NAME = re.sub(r"[^\w\-]+", "_", E("NAME") or "ClipByNaim")#!/usr/bin/env python3
+"""Runs inside GitHub Actions.
+Records an HLS link with ffmpeg -c copy (no quality loss) in ONE continuous stream, cuts it into files at
+keyframes every PART_MB megabytes (default 4000 = 4 GB, whatever time that takes) and uploads each finished
+file to Gofile while the recording keeps going. Telegram gets the links, the Status / Split / Stop buttons.
+  python gh_record.py            record
+  python gh_record.py finish     upload anything left over (used by the always() step)"""
+import os, re, sys, json, glob, time, html, queue, signal, shutil, threading, subprocess, urllib.request, urllib.parse, urllib.error
+
+E = os.environ.get
+TOKEN, CHAT = E("TG_TOKEN", ""), E("TG_CHAT", "")
+REPO, RUN = E("REPO", ""), E("RUN_ID", "local")
+URL = E("URL", "")
 NAME = re.sub(r"[^\w\-]+", "_", E("NAME") or "ClipByNaim")
 MINUTES = float(E("MINUTES") or 0)             # 0 = until Stop
 PART_MIN = float(E("PART_MIN") or 0)            # optional: also split every N minutes (0 = off, split by size only)
