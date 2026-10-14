@@ -6,25 +6,25 @@ on:
         description: "m3u8 link"
         required: true
       minutes:
-        description: "Stop after N minutes (0 = until you send /stop)"
-        default: "120"
+        description: "Stop after N minutes (0 = until you press Stop)"
+        default: "0"
       name:
         description: "File name"
         default: "ClipByNaim"
-      part_min:
-        description: "New file every N minutes (60 = auto-save every hour while recording continues)"
-        default: "60"
       part_mb:
-        description: "...or every N MB, whichever comes first (GitHub allows under 2000 MB per file)"
-        default: "1900"
+        description: "New file every N MB (4000 = 4 GB, whether that takes 1 hour or 2)"
+        default: "4000"
+      part_min:
+        description: "Optional: also split every N minutes (0 = off, split by size only)"
+        default: "0"
       referer:
         description: "Optional: website the link is played on (only if the link needs it)"
         required: false
         default: ""
 
 permissions:
-  contents: write     # upload recordings to a Release
-  actions: write      # lets a long recording continue in a new run
+  contents: read
+  actions: write      # lets a very long recording continue in a new run
 
 jobs:
   record:
@@ -36,35 +36,22 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
       RUN_ID: ${{ github.run_id }}
-      SHA: ${{ github.sha }}
       URL: ${{ inputs.url }}
       MINUTES: ${{ inputs.minutes }}
       NAME: ${{ inputs.name }}
-      PART_MIN: ${{ inputs.part_min }}
       PART_MB: ${{ inputs.part_mb }}
+      PART_MIN: ${{ inputs.part_min }}
       REFERER: ${{ inputs.referer }}
-      TG_API_ID: ${{ secrets.TG_API_ID }}
-      TG_API_HASH: ${{ secrets.TG_API_HASH }}
+      OUT_DIR: /mnt/rec
+      MP4_DIR: rec_mp4
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - name: Install Telegram uploader (only if TG_API_ID is set)
-        if: ${{ env.TG_API_ID != '' }}
-        run: python -m pip install pyrogram tgcrypto || python -m pip install pyrogram
       - name: Install ffmpeg
         run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+      - name: Use the second disk for recording
+        run: sudo mkdir -p /mnt/rec && sudo chown "$USER" /mnt/rec
       - name: Record
-        run: python gh_record.py
+        run: python3 gh_record.py
       - name: Upload leftovers if cancelled
         if: always()
-        run: python gh_record.py finish
-      - name: Keep files that failed to upload
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: failed-uploads
-          path: rec_failed/
-          if-no-files-found: ignore
-          retention-days: 3
+        run: python3 gh_record.py finish
