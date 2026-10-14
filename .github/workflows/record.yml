@@ -1,0 +1,57 @@
+name: Record
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "m3u8 link"
+        required: true
+      minutes:
+        description: "Stop after N minutes (0 = until you press Stop)"
+        default: "0"
+      name:
+        description: "File name"
+        default: "ClipByNaim"
+      part_mb:
+        description: "New file every N MB (4000 = 4 GB, whether that takes 1 hour or 2)"
+        default: "4000"
+      part_min:
+        description: "Optional: also split every N minutes (0 = off, split by size only)"
+        default: "0"
+      referer:
+        description: "Optional: website the link is played on (only if the link needs it)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  actions: write      # lets a very long recording continue in a new run
+
+jobs:
+  record:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    env:
+      TG_TOKEN: ${{ secrets.TG_TOKEN }}
+      TG_CHAT: ${{ secrets.TG_CHAT }}
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      RUN_ID: ${{ github.run_id }}
+      URL: ${{ inputs.url }}
+      MINUTES: ${{ inputs.minutes }}
+      NAME: ${{ inputs.name }}
+      PART_MB: ${{ inputs.part_mb }}
+      PART_MIN: ${{ inputs.part_min }}
+      REFERER: ${{ inputs.referer }}
+      OUT_DIR: /mnt/rec
+      MP4_DIR: rec_mp4
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ffmpeg
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+      - name: Use the second disk for recording
+        run: sudo mkdir -p /mnt/rec && sudo chown "$USER" /mnt/rec
+      - name: Record
+        run: python3 gh_record.py
+      - name: Upload leftovers if cancelled
+        if: always()
+        run: python3 gh_record.py finish
