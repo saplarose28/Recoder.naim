@@ -11,19 +11,6 @@ E = os.environ.get
 TOKEN, CHAT = E("TG_TOKEN", ""), E("TG_CHAT", "")
 REPO, RUN = E("REPO", ""), E("RUN_ID", "local")
 URL = E("URL", "")
-NAME = re.sub(r"[^\w\-]+", "_", E("NAME") or "ClipByNaim")#!/usr/bin/env python3
-"""Runs inside GitHub Actions.
-Records an HLS link with ffmpeg -c copy (no quality loss) in ONE continuous stream, cuts it into files at
-keyframes every PART_MB megabytes (default 4000 = 4 GB, whatever time that takes) and uploads each finished
-file to Gofile while the recording keeps going. Telegram gets the links, the Status / Split / Stop buttons.
-  python gh_record.py            record
-  python gh_record.py finish     upload anything left over (used by the always() step)"""
-import os, re, sys, json, glob, time, html, queue, signal, shutil, threading, subprocess, urllib.request, urllib.parse, urllib.error
-
-E = os.environ.get
-TOKEN, CHAT = E("TG_TOKEN", ""), E("TG_CHAT", "")
-REPO, RUN = E("REPO", ""), E("RUN_ID", "local")
-URL = E("URL", "")
 NAME = re.sub(r"[^\w\-]+", "_", E("NAME") or "ClipByNaim")
 MINUTES = float(E("MINUTES") or 0)             # 0 = until Stop
 PART_MIN = float(E("PART_MIN") or 0)            # optional: also split every N minutes (0 = off, split by size only)
@@ -173,7 +160,7 @@ class Splitter:
         self.want_split = False; self.manual_flag = False; self.on_manual = None
         self.hist = []
         self.aud = set(); self.cc = {}; self.last_wr = {}
-        self.skip = None; self.dropping = set(); self.drop_bytes = 0; self.deduped = 0; self.last_write = time.time()
+        self.skip = None; self.dropping = set(); self.drop_bytes = 0; self.deduped = 0; self.last_write = time.time(); self.last_es = time.time()
 
     def new_session(self):
         """ffmpeg was restarted: it re-sends some old data. Drop everything up to the last time we already wrote."""
@@ -319,6 +306,8 @@ class Splitter:
                     if self.on_manual:
                         self.on_manual(self.part_no)
             self._write(pk); self.cur_bytes += 188
+            if is_es:
+                self.last_es = time.time()                # real video/audio data was saved (not just PAT/PMT)
         self.total += end - i
         self.buf = buf[end:]
         self.hist.append((time.time(), self.total))
@@ -653,18 +642,31 @@ def record():
         while not stop.is_set():
             if time.time() >= end_at:
                 halt(); return
-            if IDLE_STOP > 0 and time.time() - SP.last_write > IDLE_STOP * 60:
+            if IDLE_STOP > 0 and time.time() - SP.last_es > IDLE_STOP * 60:
                 say("⏹ <b>The stream sent no data for %g minutes</b>, so the match has probably ended.\nSaving what I have and ending the job to save your GitHub minutes." % IDLE_STOP)
                 halt(); return
             time.sleep(2)
     threading.Thread(target=watchdog, daemon=True).start()
 
+    def stream_monitor():
+        warned, since = False, 0
+        while not stop.is_set():
+            idle = time.time() - SP.last_es
+            if not warned and idle > 90:
+                warned, since = True, time.time() - idle
+                say("⚠️ <b>The stream has not sent data for %s.</b>\nStill trying. Short breaks are repaired automatically." % mmss(idle))
+            elif warned and idle < 15:
+                warned = False
+                say("✅ <b>Stream is back</b> after %s. Recording continues in the same file." % mmss(time.time() - since))
+            time.sleep(5)
+    threading.Thread(target=stream_monitor, daemon=True).start()
+
     last_err = []; first = True
     while not stop.is_set():
         cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-y", "-fflags", "+discardcorrupt+genpts",
                "-rw_timeout", "60000000", "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "15",
-               "-seg_max_retry", "15", "-max_reload", "1000", "-m3u8_hold_counters", "1000",
-               "-live_start_index", ("-" + BACK) if first else "-2"] + HDR + [
+               "-seg_max_retry", "15", "-max_reload", "1000", "-m3u8_hold_counters", "1000", "-http_persistent", "0",
+               "-live_start_index", ("-" + BACK) if first else "-10"] + HDR + [
                "-i", URL, "-map", "0:v?", "-map", "0:a?", "-c", "copy", "-copyts", "-muxdelay", "0", "-muxpreload", "0",
                "-f", "mpegts", "-mpegts_flags", "+resend_headers", "pipe:1"]
         first = False
@@ -681,9 +683,8 @@ def record():
             break
         S["restarts"] += 1
         SP.new_session()                              # same file continues, repeated data is skipped
-        if S["restarts"] == 1 or S["restarts"] % 5 == 0:
-            say("♻️ <b>Reconnecting</b> (%d). The recording continues in the same file.\n<code>%s</code>" % (S["restarts"], esc(why_exit(p.returncode, last_err))))
-        time.sleep(5)
+        print("Reconnect %d: %s" % (S["restarts"], why_exit(p.returncode, last_err)), flush=True)   # log only, no Telegram spam
+        time.sleep(2)
     SP.finish()
     upq.put(None)
     up.join()
