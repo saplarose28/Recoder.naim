@@ -159,15 +159,18 @@ class Splitter:
         self.pat = None; self.pmt = None; self.pmt_pid = None; self.vid = None
         self.want_split = False; self.manual_flag = False; self.on_manual = None
         self.hist = []
-        self.aud = set(); self.cc = {}; self.last_wr = {}
+        self.aud = set(); self.cc = {}; self.last_wr = {}; self.jump = False
         self.skip = None; self.dropping = set(); self.drop_bytes = 0; self.deduped = 0; self.last_write = time.time(); self.last_es = time.time()
+        self.need_key = False; self.need_key_until = 0
 
-    def new_session(self):
+    def new_session(self, dedupe=True):
         """ffmpeg was restarted: it re-sends some old data. Drop everything up to the last time we already wrote."""
         self.buf = b""
         marks = {k: v for k, v in self.last_wr.items() if v is not None}
-        self.skip = dict(marks) if marks else None
+        self.skip = dict(marks) if (marks and dedupe) else None   # a live TS stream does not replay old data
         self.dropping = set(); self.drop_bytes = 0
+        self.need_key = self.vid is not None                 # a restarted live stream starts in the middle of a picture group:
+        self.need_key_until = time.time() + 20               # wait for the next keyframe so there is no broken picture
 
     def _write(self, pk):
         pid = ((pk[1] & 0x1f) << 8) | pk[2]
@@ -244,6 +247,9 @@ class Splitter:
             q += 5 + (((pk[q + 3] & 15) << 8) | pk[q + 4])
 
     def _should_split(self):
+        if self.jump:
+            self.jump = False
+            return True
         if self.want_split:
             self.want_split = False; self.manual_flag = True
             return True
@@ -281,6 +287,13 @@ class Splitter:
                     if self.drop_bytes > 80_000_000:      # timestamps do not match: stop skipping, keep recording
                         self.skip = None; self.dropping = set()
                     continue
+            if self.need_key and is_es:
+                if pid == self.vid and pusi and (pk[3] >> 4) & 2 and pk[4] > 0 and (pk[5] & 0x40):
+                    self.need_key = False
+                elif time.time() > self.need_key_until:
+                    self.need_key = False
+                else:
+                    continue
             if pid == 0 and pusi:
                 self._pat(pk)
                 if self.vid is None and self.pmt:
@@ -289,6 +302,13 @@ class Splitter:
                 self._pmt(pk)
             elif pid == self.vid and pusi:
                 if pts is not None:
+                    lastv = self.last_wr.get("v")
+                    if lastv is not None and dts is not None and self.skip is None:
+                        dd = (dts - lastv) & 0x1FFFFFFFF
+                        if dd >= 1 << 32:
+                            dd -= 1 << 33
+                        if dd < -90000 or dd > 5400000:       # timestamps jumped back >1 s or forward >60 s (source restarted)
+                            self.jump = True
                     self.last_pts = pts; self.last_wr["v"] = dts
                 if (pk[3] >> 4) & 2 and pk[4] > 0 and (pk[5] & 0x40):
                     key = True                            # random access indicator = keyframe starts here
@@ -506,6 +526,29 @@ def explain(err):
     return "Unknown reason. Read the ffmpeg line above."
 
 
+KIND = "hls"                                       # "hls" (.m3u8 playlist) or "ts" (live MPEG-TS over HTTP)
+
+
+def kind_from_url():
+    u = URL.lower()
+    path = u.split("?")[0]
+    if "m3u8" in u:
+        return "hls"
+    if path.endswith((".ts", ".mpegts", ".mts", ".m2ts")):
+        return "ts"
+    return "?"
+
+
+def probe_kind():
+    try:
+        r = subprocess.run(["ffprobe", "-v", "error", "-rw_timeout", "20000000"] + HDR + ["-show_entries", "format=format_name", "-of", "csv=p=0", URL],
+                           capture_output=True, text=True, timeout=60)
+        names = (r.stdout or "").lower()
+    except Exception:
+        names = ""
+    return "hls" if ("hls" in names or "applehttp" in names) else "ts"
+
+
 def header_sets():
     sets = []
     if REFERER:
@@ -515,6 +558,9 @@ def header_sets():
     o = _origin(URL)
     if o:
         sets.append(("browser headers with the stream's own site as referer", ["-user_agent", UA, "-referer", o + "/", "-headers", "Origin: %s\r\n" % o]))
+    if kind_from_url() != "hls":
+        sets.append(("a VLC player User-Agent", ["-user_agent", "VLC/3.0.20 LibVLC/3.0.20"]))   # IPTV servers often expect a player
+        sets.append(("the default ffmpeg User-Agent", []))
     return sets
 
 
@@ -529,7 +575,14 @@ def precheck():
             last = str(e); continue
         if r.returncode == 0:
             HDR = hdr
-            print("Link opened using: " + label, flush=True)
+            global KIND
+            KIND = kind_from_url()
+            if KIND == "?":
+                KIND = probe_kind()
+            forced = (E("STREAM_TYPE") or "auto").lower()
+            if forced in ("hls", "ts"):
+                KIND = forced
+            print("Link opened using: %s | stream type: %s" % (label, "MPEG-TS (live)" if KIND == "ts" else "HLS (.m3u8)"), flush=True)
             return True, ""
         last = mask((r.stderr or "").strip())[-400:]
         print("Could not open with %s: %s" % (label, last.splitlines()[-1] if last else "?"), flush=True)
@@ -546,7 +599,7 @@ def ask_link():
     off = 0
     for u in r.get("result", []):
         off = u["update_id"] + 1
-    say("🔗 <b>Send me the stream link</b> (the .m3u8 address) as a normal message.\nI wait 15 minutes. The link stays only in this chat.")
+    say("🔗 <b>Send me the stream link</b> (.m3u8 or .ts address) as a normal message.\nI wait 15 minutes. The link stays only in this chat.")
     deadline = time.time() + 15 * 60
     while time.time() < deadline:
         r = tg("getUpdates", offset=off, timeout=20)
@@ -622,9 +675,10 @@ def record():
         say("❌ <b>The link could not be opened from GitHub's server</b>\n<b>Reason:</b> %s\n\n<code>%s</code>" % (esc(why), esc(err[-300:])))
         sys.exit(1)
     plan = ("stops after %d min" % MINUTES) if MINUTES else "runs until you press Stop"
+    kind_txt = "📡 <b>MPEG-TS live stream</b> (starts now, no rewind)" if KIND == "ts" else "📡 HLS stream"
     every = "every %s%s" % (human(PART_MAX), (" or %g min" % PART_MIN) if PART_MIN > 0 else "")
-    say("🔴 <b>Recording started</b>\n🎬 %s\n⏱ %s\n✂️ New file %s (whichever comes first)\n📍 GitHub server: %s\nThe first download link comes after the first file is full." %
-        (esc(NAME), plan, every, esc(where())), buttons=True)
+    say("🔴 <b>Recording started</b>\n🎬 %s\n%s\n⏱ %s\n✂️ New file %s (whichever comes first)\n📍 GitHub server: %s\nThe first download link comes after the first file is full." %
+        (esc(NAME), kind_txt, plan, every, esc(where())), buttons=True)
     signal.signal(signal.SIGINT, lambda *a: halt())
     signal.signal(signal.SIGTERM, lambda *a: halt())
     total = MINUTES * 60
@@ -663,10 +717,16 @@ def record():
 
     last_err = []; first = True
     while not stop.is_set():
-        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-y", "-fflags", "+discardcorrupt+genpts",
-               "-rw_timeout", "60000000", "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "15",
-               "-seg_max_retry", "15", "-max_reload", "1000", "-m3u8_hold_counters", "1000", "-http_persistent", "0",
-               "-live_start_index", ("-" + BACK) if first else "-10"] + HDR + [
+        if KIND == "ts":
+            # no ffmpeg-internal reconnect: after a drop a NEW ffmpeg starts, so timestamps stay honest
+            # (a jump in time starts a new file, a short gap stays in the same file)
+            inopts = ["-fflags", "+discardcorrupt+genpts", "-rw_timeout", "30000000",
+                      "-probesize", "5000000", "-analyzeduration", "5000000"]
+        else:
+            inopts = ["-fflags", "+discardcorrupt+genpts", "-rw_timeout", "60000000", "-reconnect", "1", "-reconnect_streamed", "1",
+                      "-reconnect_delay_max", "15", "-seg_max_retry", "15", "-max_reload", "1000", "-m3u8_hold_counters", "1000",
+                      "-http_persistent", "0", "-live_start_index", ("-" + BACK) if first else "-10"]
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-y"] + inopts + HDR + [
                "-i", URL, "-map", "0:v?", "-map", "0:a?", "-c", "copy", "-copyts", "-muxdelay", "0", "-muxpreload", "0",
                "-f", "mpegts", "-mpegts_flags", "+resend_headers", "pipe:1"]
         first = False
@@ -682,7 +742,7 @@ def record():
         if stop.is_set() or TEST_ONCE:
             break
         S["restarts"] += 1
-        SP.new_session()                              # same file continues, repeated data is skipped
+        SP.new_session(dedupe=(KIND != "ts"))         # same file continues (HLS: repeated data is skipped)
         print("Reconnect %d: %s" % (S["restarts"], why_exit(p.returncode, last_err)), flush=True)   # log only, no Telegram spam
         time.sleep(2)
     SP.finish()
