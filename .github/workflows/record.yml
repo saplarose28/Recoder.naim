@@ -12,6 +12,14 @@ on:
       idle_min:
         description: "Stop the job when the stream sends no data for N minutes (saves GitHub minutes, 0 = off)"
         default: "10"
+      stream_type:
+        description: "Link type: auto (finds out itself), hls (.m3u8) or ts (direct MPEG-TS stream)"
+        type: choice
+        options:
+          - auto
+          - hls
+          - ts
+        default: auto
       name:
         description: "File name"
         default: "ClipByNaim"
@@ -43,6 +51,7 @@ jobs:
       URL: ${{ inputs.url }}
       MINUTES: ${{ inputs.minutes }}
       IDLE_STOP_MIN: ${{ inputs.idle_min }}
+      STREAM_TYPE: ${{ inputs.stream_type }}
       NAME: ${{ inputs.name }}
       PART_MB: ${{ inputs.part_mb }}
       PART_MIN: ${{ inputs.part_min }}
