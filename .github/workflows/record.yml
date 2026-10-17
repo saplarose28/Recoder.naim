@@ -43,6 +43,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 355
     env:
+      PYTHONUNBUFFERED: "1"
       TG_TOKEN: ${{ secrets.TG_TOKEN }}
       TG_CHAT: ${{ secrets.TG_CHAT }}
       GH_TOKEN: ${{ github.token }}
