@@ -187,6 +187,19 @@ def shift_ts(pk, off):
     return b
 
 
+def vsig(pk):
+    """Fingerprint of a video picture: the first bytes of its data (after the PES header)."""
+    afc = (pk[3] >> 4) & 3
+    p = 4 + ((1 + pk[4]) if afc & 2 else 0)
+    st = p + 9 + pk[p + 8]
+    return bytes(pk[st:min(st + 24, 188)])
+
+
+def same_sig(a, b):
+    n = min(len(a), len(b) if b else 0)
+    return b is not None and n >= 8 and a[:n] == b[:n]
+
+
 class Splitter:
     def __init__(self, on_done):
         self.on_done = on_done
@@ -201,15 +214,20 @@ class Splitter:
         self.off = 0; self.last_out_v = None; self.fdur = 3600; self.rebased = 0     # timestamp shift so reconnects join smoothly
         self.skip = None; self.dropping = set(); self.drop_bytes = 0; self.deduped = 0; self.last_write = time.time(); self.last_es = time.time()
         self.need_key = False; self.need_key_until = 0
+        self.recent = {}; self.verify = False                # dts -> fingerprint of recently saved pictures
 
-    def new_session(self, dedupe=True):
+    def new_session(self, dedupe=True, verify=False):
         """ffmpeg was restarted: it re-sends some old data. Drop everything up to the last time we already wrote."""
         self.buf = b""
         marks = {k: v for k, v in self.last_wr.items() if v is not None}
-        self.skip = dict(marks) if (marks and dedupe) else None   # a live TS stream does not replay old data
+        self.skip = dict(marks) if (marks and dedupe) else None
         self.dropping = set(); self.drop_bytes = 0
-        self.need_key = self.vid is not None                 # a restarted live stream starts in the middle of a picture group:
-        self.need_key_until = time.time() + 20               # wait for the next keyframe so there is no broken picture
+        # If we skip repeated data, the new data continues right after what is already saved (same picture group),
+        # so no keyframe is needed. Otherwise wait for the next keyframe so there is no broken picture.
+        self.verify = self.skip is not None and verify        # TS: the first old picture must really be one we saved (HLS replays many segments, no check)
+        self.need_key = self.vid is not None and self.skip is None
+        self.need_key_until = time.time() + 20
+        print("New connection. Repeated data dropped so far: %.1f MB" % (self.deduped / 1e6), flush=True)
 
     def _write(self, pk):
         pid = ((pk[1] & 0x1f) << 8) | pk[2]
@@ -312,12 +330,25 @@ class Splitter:
                 if pusi:
                     k = "v" if pid == self.vid else pid
                     last = self.skip.get(k)
+                    fresh = False
                     if last is None or dts is None:
                         ahead = True
                     else:
                         d = sdiff(dts, last)
                         ahead = d > 0 or d < -DUP_WINDOW   # newer than what we saved, or the server clock restarted
-                    if ahead:
+                        if not ahead and pid == self.vid and self.verify:
+                            self.verify = False
+                            if not same_sig(vsig(pk), self.recent.get(dts)):
+                                fresh = True               # not a picture we saved: new content with a restarted clock
+                    if fresh:
+                        print("Server restarted its clock with NEW content: nothing is dropped, timeline is joined instead", flush=True)
+                        self.skip = None; self.dropping = set()
+                        self.need_key = True; self.need_key_until = time.time() + 20
+                    elif ahead:
+                        if pid == self.vid and last is not None and dts is not None:
+                            self.verify = False
+                            if not (0 < sdiff(dts, last) <= max(3 * self.fdur, 9000)):
+                                self.need_key = True; self.need_key_until = time.time() + 20   # not the very next picture: gap, wait for keyframe
                         self.skip.pop(k, None); self.dropping.discard(pid)
                         if not self.skip:
                             self.skip = None
@@ -358,6 +389,9 @@ class Splitter:
                     self.last_pts = (pts + self.off) & M33
                     self.last_out_v = (dts + self.off) & M33
                     self.last_wr["v"] = dts               # raw value, used to skip repeated data after a reconnect
+                    self.recent[dts] = vsig(pk)
+                    if len(self.recent) > 3000:
+                        del self.recent[next(iter(self.recent))]
                 if (pk[3] >> 4) & 2 and pk[4] > 0 and (pk[5] & 0x40):
                     key = True                            # random access indicator = keyframe starts here
             elif pid in self.aud and pusi and dts is not None:
@@ -760,7 +794,7 @@ def record():
                 if it[0] == "d":
                     SP.feed(it[1])
                 else:
-                    SP.new_session(dedupe=it[1])
+                    SP.new_session(dedupe=it[1], verify=it[2])
             except Exception as e:
                 print("splitter error:", repr(e), flush=True)
                 SP.buf = b""
@@ -822,7 +856,7 @@ def record():
         if stop.is_set() or TEST_ONCE:
             break
         S["restarts"] += 1
-        rq.put(("n", KIND != "ts"))                    # processed in order, after the data already queued
+        rq.put(("n", True, KIND == "ts"))                    # processed in order, after the data already queued
         S["reason"] = why_exit(p.returncode, last_err)
         consec = 0 if time.time() - t_run > 30 else consec + 1
         print("Reconnect %d (queue peak %d): %s" % (S["restarts"], S["qmax"], S["reason"]), flush=True)   # log only, no Telegram spam
