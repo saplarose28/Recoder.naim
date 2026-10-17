@@ -1,11 +1,22 @@
 #!/usr/bin/env python3
 """Runs inside GitHub Actions.
-Records an HLS link with ffmpeg -c copy (no quality loss) in ONE continuous stream, cuts it into files at
+Records an HLS / MPEG-TS link with ffmpeg -c copy (no quality loss) in ONE continuous stream, cuts it into files at
 keyframes every PART_MB megabytes (default 4000 = 4 GB, whatever time that takes) and uploads each finished
 file to Gofile while the recording keeps going. Telegram gets the links, the Status / Split / Stop buttons.
+
+Reconnect behaviour:
+  * a reader thread + big memory queue keep ffmpeg's pipe empty, so a slow disk/upload never makes the server drop us
+  * when ffmpeg has to reconnect, HLS restarts RECON_BACK segments behind live (old data is skipped, nothing is lost)
+  * if the server restarts its clock on reconnect, the timestamps are shifted so the video continues smoothly in the
+    SAME file. A new file is made only at PART_MB (or the Split button), never because of a reconnect.
+
   python gh_record.py            record
   python gh_record.py finish     upload anything left over (used by the always() step)"""
 import os, re, sys, json, glob, time, html, queue, signal, shutil, threading, subprocess, urllib.request, urllib.parse, urllib.error
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 
 E = os.environ.get
 TOKEN, CHAT = E("TG_TOKEN", ""), E("TG_CHAT", "")
@@ -16,6 +27,7 @@ MINUTES = float(E("MINUTES") or 0)             # 0 = until Stop
 PART_MIN = float(E("PART_MIN") or 0)            # optional: also split every N minutes (0 = off, split by size only)
 PART_MAX = min(float(E("PART_MB") or 4000), 5000) * 1e6   # a new file every N MB (4000 = 4 GB)
 BACK = E("BACK_SEGS") or "5"                    # start N segments behind live (safety)
+RECON_BACK = E("RECON_BACK") or "12"            # after a reconnect (HLS): start N segments behind, repeated data is skipped
 OUT = E("OUT_DIR") or "rec"
 MP4_DIR = E("MP4_DIR") or OUT                    # finished .mp4 files (a different disk folder from the .ts files)
 FAILED = E("FAILED_DIR") or "rec_failed"
@@ -33,8 +45,13 @@ UA = E("UA") or "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KH
 REFERER = E("REFERER") or ""
 HDR = ["-user_agent", UA]
 
+M33 = 0x1FFFFFFFF                               # 33 bit timestamp mask (90 kHz clock)
+JUMP_BACK = 90000                               # clock went back more than 1 s  -> source restarted
+JUMP_FWD = 270000                               # clock jumped forward more than 3 s -> close the gap, keep it smooth
+DUP_WINDOW = 90000 * 600                        # data up to 10 min older than what we saved counts as "already have it"
+
 stop = threading.Event()
-S = {"proc": None, "t0": time.time(), "restarts": 0, "done": [], "page": "", "last_data": time.time()}
+S = {"proc": None, "t0": time.time(), "restarts": 0, "done": [], "page": "", "last_data": time.time(), "reason": "", "qmax": 0}
 upq = queue.Queue()
 SP = None
 
@@ -124,16 +141,6 @@ def summary(text):
 
 
 # ---------------- MPEG-TS splitter (cuts at keyframes, recording never stops) ----------------
-def pes_pts(pk):
-    afc = (pk[3] >> 4) & 3
-    if not afc & 1:
-        return None
-    p = 4 + ((1 + pk[4]) if afc & 2 else 0)
-    if p + 14 > 188 or pk[p] or pk[p + 1] or pk[p + 2] != 1 or not (pk[p + 7] & 0x80):
-        return None
-    return ((pk[p + 9] >> 1) & 7) * 1073741824 + ((pk[p + 10] << 22) | ((pk[p + 11] >> 1) << 15) | (pk[p + 12] << 7) | (pk[p + 13] >> 1))
-
-
 def pes_times(pk):
     """(pts, dts) of the PES that starts in this packet; dts falls back to pts."""
     afc = (pk[3] >> 4) & 3
@@ -149,6 +156,37 @@ def pes_times(pk):
     return pts, dts
 
 
+def sdiff(a, b):
+    """a - b on the 33 bit clock, as a signed number."""
+    d = (a - b) & M33
+    return d - (1 << 33) if d >= (1 << 32) else d
+
+
+def shift_ts(pk, off):
+    """Return a copy of the packet with PTS, DTS and PCR moved by off (90 kHz ticks)."""
+    b = bytearray(pk)
+    afc = (pk[3] >> 4) & 3
+    if afc & 2 and pk[4] >= 7 and pk[5] & 0x10:                     # PCR in the adaptation field
+        base = ((pk[6] << 25) | (pk[7] << 17) | (pk[8] << 9) | (pk[9] << 1) | (pk[10] >> 7))
+        base = (base + off) & M33
+        b[6] = (base >> 25) & 0xFF; b[7] = (base >> 17) & 0xFF; b[8] = (base >> 9) & 0xFF; b[9] = (base >> 1) & 0xFF
+        b[10] = ((base & 1) << 7) | (pk[10] & 0x7F)
+    if afc & 1 and (pk[1] & 0x40):                                   # PES header with PTS (and DTS)
+        p = 4 + ((1 + pk[4]) if afc & 2 else 0)
+        if p + 14 <= 188 and not pk[p] and not pk[p + 1] and pk[p + 2] == 1 and (pk[p + 7] & 0x80):
+            def put(i):
+                v = (((pk[i] >> 1) & 7) * 1073741824 + ((pk[i + 1] << 22) | ((pk[i + 2] >> 1) << 15) | (pk[i + 3] << 7) | (pk[i + 4] >> 1)) + off) & M33
+                b[i] = (pk[i] & 0xF0) | (((v >> 30) & 7) << 1) | 1
+                b[i + 1] = (v >> 22) & 0xFF
+                b[i + 2] = (((v >> 15) & 0x7F) << 1) | 1
+                b[i + 3] = (v >> 7) & 0xFF
+                b[i + 4] = ((v & 0x7F) << 1) | 1
+            put(p + 9)
+            if (pk[p + 7] & 0x40) and p + 19 <= 188:
+                put(p + 14)
+    return b
+
+
 class Splitter:
     def __init__(self, on_done):
         self.on_done = on_done
@@ -159,7 +197,8 @@ class Splitter:
         self.pat = None; self.pmt = None; self.pmt_pid = None; self.vid = None
         self.want_split = False; self.manual_flag = False; self.on_manual = None
         self.hist = []
-        self.aud = set(); self.cc = {}; self.last_wr = {}; self.jump = False
+        self.aud = set(); self.cc = {}; self.last_wr = {}
+        self.off = 0; self.last_out_v = None; self.fdur = 3600; self.rebased = 0     # timestamp shift so reconnects join smoothly
         self.skip = None; self.dropping = set(); self.drop_bytes = 0; self.deduped = 0; self.last_write = time.time(); self.last_es = time.time()
         self.need_key = False; self.need_key_until = 0
 
@@ -247,9 +286,7 @@ class Splitter:
             q += 5 + (((pk[q + 3] & 15) << 8) | pk[q + 4])
 
     def _should_split(self):
-        if self.jump:
-            self.jump = False
-            return True
+        # only: Split button, optional time limit, or the size limit. A reconnect / clock jump never splits a file.
         if self.want_split:
             self.want_split = False; self.manual_flag = True
             return True
@@ -275,7 +312,11 @@ class Splitter:
                 if pusi:
                     k = "v" if pid == self.vid else pid
                     last = self.skip.get(k)
-                    ahead = last is None or dts is None or 0 < ((dts - last) & 0x1FFFFFFFF) < 0x100000000
+                    if last is None or dts is None:
+                        ahead = True
+                    else:
+                        d = sdiff(dts, last)
+                        ahead = d > 0 or d < -DUP_WINDOW   # newer than what we saved, or the server clock restarted
                     if ahead:
                         self.skip.pop(k, None); self.dropping.discard(pid)
                         if not self.skip:
@@ -284,7 +325,7 @@ class Splitter:
                         self.dropping.add(pid)
                 if pid in self.dropping:
                     self.drop_bytes += 188; self.deduped += 188
-                    if self.drop_bytes > 80_000_000:      # timestamps do not match: stop skipping, keep recording
+                    if self.drop_bytes > 400_000_000:     # timestamps do not match: stop skipping, keep recording
                         self.skip = None; self.dropping = set()
                     continue
             if self.need_key and is_es:
@@ -303,13 +344,20 @@ class Splitter:
             elif pid == self.vid and pusi:
                 if pts is not None:
                     lastv = self.last_wr.get("v")
-                    if lastv is not None and dts is not None and self.skip is None:
-                        dd = (dts - lastv) & 0x1FFFFFFFF
-                        if dd >= 1 << 32:
-                            dd -= 1 << 33
-                        if dd < -90000 or dd > 5400000:       # timestamps jumped back >1 s or forward >60 s (source restarted)
-                            self.jump = True
-                    self.last_pts = pts; self.last_wr["v"] = dts
+                    if lastv is not None and self.skip is None:
+                        dd = sdiff(dts, lastv)
+                        if dd < -JUMP_BACK or dd > JUMP_FWD:
+                            # the server clock jumped (reconnect / restart): shift all following timestamps so the
+                            # picture continues one frame after the last one. Same file, no cut, no freeze.
+                            if self.last_out_v is not None:
+                                self.off = (self.last_out_v + self.fdur - dts) & M33
+                                self.rebased += 1
+                                print("Clock jump %+.1fs: timeline joined smoothly (join #%d)" % (dd / 90000.0, self.rebased), flush=True)
+                        elif 0 < dd <= 18000:
+                            self.fdur = dd                # normal picture spacing, used to place the first picture after a join
+                    self.last_pts = (pts + self.off) & M33
+                    self.last_out_v = (dts + self.off) & M33
+                    self.last_wr["v"] = dts               # raw value, used to skip repeated data after a reconnect
                 if (pk[3] >> 4) & 2 and pk[4] > 0 and (pk[5] & 0x40):
                     key = True                            # random access indicator = keyframe starts here
             elif pid in self.aud and pusi and dts is not None:
@@ -325,12 +373,17 @@ class Splitter:
                     self.manual_flag = False
                     if self.on_manual:
                         self.on_manual(self.part_no)
+            if self.off and (pts is not None or ((pk[3] >> 4) & 2 and pk[4] >= 7 and pk[5] & 0x10)):
+                pk = shift_ts(pk, self.off)
             self._write(pk); self.cur_bytes += 188
             if is_es:
                 self.last_es = time.time()                # real video/audio data was saved (not just PAT/PMT)
         self.total += end - i
         self.buf = buf[end:]
-        self.hist.append((time.time(), self.total))
+        now = time.time()
+        self.hist.append((now, self.total))
+        if len(self.hist) > 1500:
+            self.hist = [h for h in self.hist if now - h[0] <= 15]
 
 
 # ---------------- messages ----------------
@@ -355,7 +408,9 @@ def status_text():
         "⚡ <b>Speed</b>  %.1f Mbps" % spd + nxt,
     ]
     if S["restarts"]:
-        lines.append("♻️ <b>Reconnects</b>  %d" % S["restarts"])
+        lines.append("♻️ <b>Reconnects</b>  %d  (files are NOT cut by reconnects)" % S["restarts"])
+        if S["reason"]:
+            lines.append("<code>%s</code>" % esc(S["reason"][:160]))
     if S["page"]:
         lines += ["", '📂 <a href="%s">Open the download page</a>' % S["page"]]
     return "\n".join(lines)
@@ -427,7 +482,7 @@ def gofile_upload(path):
         print("[dry] would upload to gofile", path); return True, "https://gofile.io/d/DRYRUN", ""
     err = ""
     for attempt in range(6):
-        cmd = ["curl", "-sS", "-m", "3600", "-F", "file=@" + path]
+        cmd = ["nice", "-n", "10", "curl", "-sS", "-m", "3600", "-F", "file=@" + path]   # low priority: never starve the recorder
         if GF["folder"] and GF["token"]:
             cmd += ["-F", "folderId=" + GF["folder"], "-F", "token=" + GF["token"]]
         r = subprocess.run(cmd + [GOFILE_URL], capture_output=True, text=True)
@@ -464,7 +519,7 @@ def process(ts):
     os.makedirs(MP4_DIR, exist_ok=True)
     base = os.path.basename(ts)[:-3] + ".mp4"
     mp4 = os.path.join(MP4_DIR, base)
-    r = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", ts, "-c", "copy", "-avoid_negative_ts", "make_zero", "-movflags", "+faststart", mp4],
+    r = subprocess.run(["nice", "-n", "10", "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", ts, "-c", "copy", "-avoid_negative_ts", "make_zero", "-movflags", "+faststart", mp4],
                        capture_output=True, text=True)
     if r.returncode != 0 or not os.path.exists(mp4):
         mp4 = ts; base = os.path.basename(ts)
@@ -692,6 +747,26 @@ def record():
     SP.on_manual = lambda n: say("✂️ <b>Split done</b>\nFile #%d started. Recording continues." % n, buttons=True)
     end_at = S["t0"] + (min(total, LIMIT) if total else LIMIT)
 
+    # The reader (below) only moves bytes from ffmpeg into this queue. The splitter works on the other side.
+    # So a slow disk, a busy CPU or an upload can never make the pipe full and the server drop the connection.
+    rq = queue.Queue(maxsize=4000)
+
+    def consumer():
+        while True:
+            it = rq.get()
+            if it is None:
+                return
+            try:
+                if it[0] == "d":
+                    SP.feed(it[1])
+                else:
+                    SP.new_session(dedupe=it[1])
+            except Exception as e:
+                print("splitter error:", repr(e), flush=True)
+                SP.buf = b""
+    ct = threading.Thread(target=consumer)
+    ct.start()
+
     def watchdog():
         while not stop.is_set():
             if time.time() >= end_at:
@@ -715,36 +790,45 @@ def record():
             time.sleep(5)
     threading.Thread(target=stream_monitor, daemon=True).start()
 
-    last_err = []; first = True
+    last_err = []; first = True; consec = 0
     while not stop.is_set():
         if KIND == "ts":
-            # no ffmpeg-internal reconnect: after a drop a NEW ffmpeg starts, so timestamps stay honest
-            # (a jump in time starts a new file, a short gap stays in the same file)
-            inopts = ["-fflags", "+discardcorrupt+genpts", "-rw_timeout", "30000000",
-                      "-probesize", "5000000", "-analyzeduration", "5000000"]
+            # no ffmpeg-internal reconnect: after a drop a NEW ffmpeg starts quickly (small probe), and the splitter
+            # joins the timeline, so a restarted server clock does not matter
+            inopts = ["-fflags", "+discardcorrupt+genpts", "-rw_timeout", "20000000",
+                      "-probesize", "2000000", "-analyzeduration", "1500000"]
         else:
             inopts = ["-fflags", "+discardcorrupt+genpts", "-rw_timeout", "60000000", "-reconnect", "1", "-reconnect_streamed", "1",
                       "-reconnect_delay_max", "15", "-seg_max_retry", "15", "-max_reload", "1000", "-m3u8_hold_counters", "1000",
-                      "-http_persistent", "0", "-live_start_index", ("-" + BACK) if first else "-10"]
+                      "-http_persistent", "0", "-live_start_index", ("-" + BACK) if first else ("-" + RECON_BACK)]
         cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-y"] + inopts + HDR + [
                "-i", URL, "-map", "0:v?", "-map", "0:a?", "-c", "copy", "-copyts", "-muxdelay", "0", "-muxpreload", "0",
                "-f", "mpegts", "-mpegts_flags", "+resend_headers", "pipe:1"]
         first = False
+        t_run = time.time()
         p = S["proc"] = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
+        if fcntl:
+            try: fcntl.fcntl(p.stdout.fileno(), 1031, 1 << 20)       # F_SETPIPE_SZ: 1 MB pipe
+            except Exception: pass
         last_err = []
         threading.Thread(target=stderr_reader, args=(p, last_err), daemon=True).start()
         while True:
-            data = p.stdout.read(188 * 1024)
+            data = p.stdout.read(1 << 20)
             if not data:
                 break
-            SP.feed(data); S["last_data"] = time.time()
+            rq.put(("d", data)); S["last_data"] = time.time()
+            S["qmax"] = max(S["qmax"], rq.qsize())
         p.wait()
         if stop.is_set() or TEST_ONCE:
             break
         S["restarts"] += 1
-        SP.new_session(dedupe=(KIND != "ts"))         # same file continues (HLS: repeated data is skipped)
-        print("Reconnect %d: %s" % (S["restarts"], why_exit(p.returncode, last_err)), flush=True)   # log only, no Telegram spam
-        time.sleep(2)
+        rq.put(("n", KIND != "ts"))                    # processed in order, after the data already queued
+        S["reason"] = why_exit(p.returncode, last_err)
+        consec = 0 if time.time() - t_run > 30 else consec + 1
+        print("Reconnect %d (queue peak %d): %s" % (S["restarts"], S["qmax"], S["reason"]), flush=True)   # log only, no Telegram spam
+        time.sleep(min(0.5 + 0.5 * consec, 5))
+    rq.put(None)
+    ct.join()
     SP.finish()
     upq.put(None)
     up.join()
