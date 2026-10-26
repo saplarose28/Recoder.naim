@@ -1,22 +1,11 @@
 #!/usr/bin/env python3
 """Runs inside GitHub Actions.
-Records an HLS / MPEG-TS link with ffmpeg -c copy (no quality loss) in ONE continuous stream, cuts it into files at
+Records an HLS link with ffmpeg -c copy (no quality loss) in ONE continuous stream, cuts it into files at
 keyframes every PART_MB megabytes (default 4000 = 4 GB, whatever time that takes) and uploads each finished
 file to Gofile while the recording keeps going. Telegram gets the links, the Status / Split / Stop buttons.
-
-Reconnect behaviour:
-  * a reader thread + big memory queue keep ffmpeg's pipe empty, so a slow disk/upload never makes the server drop us
-  * when ffmpeg has to reconnect, HLS restarts RECON_BACK segments behind live (old data is skipped, nothing is lost)
-  * if the server restarts its clock on reconnect, the timestamps are shifted so the video continues smoothly in the
-    SAME file. A new file is made only at PART_MB (or the Split button), never because of a reconnect.
-
   python gh_record.py            record
   python gh_record.py finish     upload anything left over (used by the always() step)"""
-import os, re, sys, json, glob, time, html, queue, signal, shutil, threading, subprocess, urllib.request, urllib.parse, urllib.error
-try:
-    import fcntl
-except ImportError:
-    fcntl = None
+import os, re, ssl, sys, json, glob, time, html, queue, signal, shutil, threading, subprocess, urllib.request, urllib.parse, urllib.error
 
 E = os.environ.get
 TOKEN, CHAT = E("TG_TOKEN", ""), E("TG_CHAT", "")
@@ -27,7 +16,6 @@ MINUTES = float(E("MINUTES") or 0)             # 0 = until Stop
 PART_MIN = float(E("PART_MIN") or 0)            # optional: also split every N minutes (0 = off, split by size only)
 PART_MAX = min(float(E("PART_MB") or 4000), 5000) * 1e6   # a new file every N MB (4000 = 4 GB)
 BACK = E("BACK_SEGS") or "5"                    # start N segments behind live (safety)
-RECON_BACK = E("RECON_BACK") or "12"            # after a reconnect (HLS): start N segments behind, repeated data is skipped
 OUT = E("OUT_DIR") or "rec"
 MP4_DIR = E("MP4_DIR") or OUT                    # finished .mp4 files (a different disk folder from the .ts files)
 FAILED = E("FAILED_DIR") or "rec_failed"
@@ -44,14 +32,10 @@ RUN_URL = "https://github.com/%s/actions/runs/%s" % (REPO, RUN)
 UA = E("UA") or "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36"
 REFERER = E("REFERER") or ""
 HDR = ["-user_agent", UA]
-
-M33 = 0x1FFFFFFFF                               # 33 bit timestamp mask (90 kHz clock)
-JUMP_BACK = 90000                               # clock went back more than 1 s  -> source restarted
-JUMP_FWD = 270000                               # clock jumped forward more than 3 s -> close the gap, keep it smooth
-DUP_WINDOW = 90000 * 600                        # data up to 10 min older than what we saved counts as "already have it"
+REQ_HDR = {"User-Agent": UA, "Accept": "*/*", "Accept-Encoding": "identity", "Connection": "keep-alive"}
 
 stop = threading.Event()
-S = {"proc": None, "t0": time.time(), "restarts": 0, "done": [], "page": "", "last_data": time.time(), "reason": "", "qmax": 0}
+S = {"proc": None, "t0": time.time(), "restarts": 0, "done": [], "page": "", "last_data": time.time(), "drops": [], "gap_total": 0.0, "stop_t": 0, "src_done": threading.Event()}
 upq = queue.Queue()
 SP = None
 
@@ -141,6 +125,16 @@ def summary(text):
 
 
 # ---------------- MPEG-TS splitter (cuts at keyframes, recording never stops) ----------------
+def pes_pts(pk):
+    afc = (pk[3] >> 4) & 3
+    if not afc & 1:
+        return None
+    p = 4 + ((1 + pk[4]) if afc & 2 else 0)
+    if p + 14 > 188 or pk[p] or pk[p + 1] or pk[p + 2] != 1 or not (pk[p + 7] & 0x80):
+        return None
+    return ((pk[p + 9] >> 1) & 7) * 1073741824 + ((pk[p + 10] << 22) | ((pk[p + 11] >> 1) << 15) | (pk[p + 12] << 7) | (pk[p + 13] >> 1))
+
+
 def pes_times(pk):
     """(pts, dts) of the PES that starts in this packet; dts falls back to pts."""
     afc = (pk[3] >> 4) & 3
@@ -156,90 +150,107 @@ def pes_times(pk):
     return pts, dts
 
 
-def sdiff(a, b):
-    """a - b on the 33 bit clock, as a signed number."""
-    d = (a - b) & M33
-    return d - (1 << 33) if d >= (1 << 32) else d
+MASK33 = 0x1FFFFFFFF
+ES_TYPES = {0x01, 0x02, 0x03, 0x04, 0x06, 0x0f, 0x10, 0x11, 0x1b, 0x24, 0x81, 0x87}
+VIDEO_TYPES = {0x01, 0x02, 0x10, 0x1b, 0x24}
 
 
-def shift_ts(pk, off):
-    """Return a copy of the packet with PTS, DTS and PCR moved by off (90 kHz ticks)."""
-    b = bytearray(pk)
-    afc = (pk[3] >> 4) & 3
-    if afc & 2 and pk[4] >= 7 and pk[5] & 0x10:                     # PCR in the adaptation field
-        base = ((pk[6] << 25) | (pk[7] << 17) | (pk[8] << 9) | (pk[9] << 1) | (pk[10] >> 7))
-        base = (base + off) & M33
-        b[6] = (base >> 25) & 0xFF; b[7] = (base >> 17) & 0xFF; b[8] = (base >> 9) & 0xFF; b[9] = (base >> 1) & 0xFF
-        b[10] = ((base & 1) << 7) | (pk[10] & 0x7F)
-    if afc & 1 and (pk[1] & 0x40):                                   # PES header with PTS (and DTS)
-        p = 4 + ((1 + pk[4]) if afc & 2 else 0)
-        if p + 14 <= 188 and not pk[p] and not pk[p + 1] and pk[p + 2] == 1 and (pk[p + 7] & 0x80):
-            def put(i):
-                v = (((pk[i] >> 1) & 7) * 1073741824 + ((pk[i + 1] << 22) | ((pk[i + 2] >> 1) << 15) | (pk[i + 3] << 7) | (pk[i + 4] >> 1)) + off) & M33
-                b[i] = (pk[i] & 0xF0) | (((v >> 30) & 7) << 1) | 1
-                b[i + 1] = (v >> 22) & 0xFF
-                b[i + 2] = (((v >> 15) & 0x7F) << 1) | 1
-                b[i + 3] = (v >> 7) & 0xFF
-                b[i + 4] = ((v & 0x7F) << 1) | 1
-            put(p + 9)
-            if (pk[p + 7] & 0x40) and p + 19 <= 188:
-                put(p + 14)
-    return b
+def _rd5(b, i):
+    return ((b[i] >> 1) & 7) * 1073741824 + ((b[i + 1] << 22) | ((b[i + 2] >> 1) << 15) | (b[i + 3] << 7) | (b[i + 4] >> 1))
 
 
-def vsig(pk):
-    """Fingerprint of a video picture: the first bytes of its data (after the PES header)."""
-    afc = (pk[3] >> 4) & 3
-    p = 4 + ((1 + pk[4]) if afc & 2 else 0)
-    st = p + 9 + pk[p + 8]
-    return bytes(pk[st:min(st + 24, 188)])
+def _wr5(b, i, v):
+    v &= MASK33
+    b[i] = (b[i] & 0xF0) | (((v >> 30) & 7) << 1) | 1
+    b[i + 1] = (v >> 22) & 255
+    b[i + 2] = (((v >> 15) & 127) << 1) | 1
+    b[i + 3] = (v >> 7) & 255
+    b[i + 4] = ((v & 127) << 1) | 1
 
 
-def same_sig(a, b):
-    n = min(len(a), len(b) if b else 0)
-    return b is not None and n >= 8 and a[:n] == b[:n]
+def shift_pes(b, off):
+    """add `off` ticks to the PTS/DTS of the PES header that starts in this packet"""
+    afc = (b[3] >> 4) & 3
+    p = 4 + ((1 + b[4]) if afc & 2 else 0)
+    fl = b[p + 7]
+    if fl & 0x80:
+        _wr5(b, p + 9, _rd5(b, p + 9) + off)
+    if (fl & 0x40) and p + 19 <= 188:
+        _wr5(b, p + 14, _rd5(b, p + 14) + off)
+
+
+def shift_pcr(b, off):
+    if (b[3] & 0x20) and b[4] >= 7 and (b[5] & 0x10):
+        base = ((b[6] << 25) | (b[7] << 17) | (b[8] << 9) | (b[9] << 1) | (b[10] >> 7))
+        base = (base + off) & MASK33
+        b[6] = (base >> 25) & 255; b[7] = (base >> 17) & 255; b[8] = (base >> 9) & 255; b[9] = (base >> 1) & 255
+        b[10] = ((base & 1) << 7) | (b[10] & 0x7F)
 
 
 class Splitter:
+    """Takes MPEG-TS bytes (from ffmpeg or straight from a link) and writes them to files that are cut at keyframes.
+    * a reconnect never starts a new file: timestamps are re-based so the picture simply continues (no freeze, no jump back)
+    * the picture that was cut in half by a drop is thrown away (no broken frame)
+    * files are only cut when they reach PART_MB (or on the Split button)"""
+
     def __init__(self, on_done):
         self.on_done = on_done
-        self.buf = b""
+        self.buf = b""; self.need_sync = True
         self.f = None; self.path = ""
         self.part_no = 0; self.cur_bytes = 0; self.total = 0
         self.start_pts = None; self.last_pts = None
         self.pat = None; self.pmt = None; self.pmt_pid = None; self.vid = None
         self.want_split = False; self.manual_flag = False; self.on_manual = None
         self.hist = []
-        self.aud = set(); self.cc = {}; self.last_wr = {}
-        self.off = 0; self.last_out_v = None; self.fdur = 3600; self.rebased = 0     # timestamp shift so reconnects join smoothly
-        self.skip = None; self.dropping = set(); self.drop_bytes = 0; self.deduped = 0; self.last_write = time.time(); self.last_es = time.time()
+        self.es = set(); self.aud = set(); self.pcr = None; self.allowed = None
+        self.cc = {}; self.last_wr = {}
+        self.skip = None; self.dropping = set(); self.drop_bytes = 0; self.deduped = 0
+        self.last_write = time.time(); self.last_es = time.time()
         self.need_key = False; self.need_key_until = 0
-        self.recent = {}; self.verify = False                # dts -> fingerprint of recently saved pictures
+        self.off = 0; self.last_raw_v = None; self.last_out_v = None; self.max_out_pts = None; self.fd = 3600
+        self.rebase_pending = False; self.rebases = 0
+        self.held = {}; self.last_out_es = {}; self.drop_pes = set()
 
-    def new_session(self, dedupe=True, verify=False):
-        """ffmpeg was restarted: it re-sends some old data. Drop everything up to the last time we already wrote."""
-        self.buf = b""
+    # ---- sessions ----
+    def new_session(self, dedupe=True):
+        """The source was reconnected."""
+        self.buf = b""; self.need_sync = True
+        self.held = {}; self.drop_pes = set()                # a picture that was cut in half is dropped
         marks = {k: v for k, v in self.last_wr.items() if v is not None}
-        self.skip = dict(marks) if (marks and dedupe) else None
+        self.skip = dict(marks) if (marks and dedupe) else None   # HLS replays old data: skip what we already have
         self.dropping = set(); self.drop_bytes = 0
-        # If we skip repeated data, the new data continues right after what is already saved (same picture group),
-        # so no keyframe is needed. Otherwise wait for the next keyframe so there is no broken picture.
-        self.verify = self.skip is not None and verify        # TS: the first old picture must really be one we saved (HLS replays many segments, no check)
-        self.need_key = self.vid is not None and self.skip is None
-        self.need_key_until = time.time() + 20
-        print("New connection. Repeated data dropped so far: %.1f MB" % (self.deduped / 1e6), flush=True)
+        if dedupe:
+            self.need_key = False                            # exact continuation of the same timeline
+            self.rebase_pending = False
+        else:
+            self.need_key = self.vid is not None             # a live link resumes mid-picture: wait for a keyframe
+            self.need_key_until = time.time() + 20
+            self.rebase_pending = self.vid is not None       # and continue the time line right after the last picture
 
-    def _write(self, pk):
-        pid = ((pk[1] & 0x1f) << 8) | pk[2]
-        b = bytearray(pk)
-        if (pk[3] >> 4) & 1:                              # packet has payload: continue the counter without gaps
+    # ---- output ----
+    def _write(self, b):
+        pid = ((b[1] & 0x1f) << 8) | b[2]
+        if (b[3] >> 4) & 1:                                  # payload: keep the continuity counter unbroken
             c = (self.cc.get(pid, -1) + 1) & 15
             self.cc[pid] = c
         else:
             c = self.cc.get(pid, 0)
         b[3] = (b[3] & 0xF0) | c
-        self.f.write(b)
+        self.f.write(b); self.cur_bytes += 188
         self.last_write = time.time()
+
+    def _flush(self, pid):
+        ent = self.held.pop(pid, None)
+        if not ent:
+            return
+        dts, pkts = ent
+        if self.f is None:
+            return
+        for b in pkts:
+            self._write(b)
+        if dts is not None:
+            self.last_wr["v" if pid == self.vid else pid] = dts
+        self.last_es = time.time()
 
     def media_secs(self):
         if self.start_pts is None or self.last_pts is None:
@@ -260,9 +271,9 @@ class Splitter:
         self.f = open(self.path, "wb")
         self.cur_bytes = 0
         self.start_pts = self.last_pts
-        for p in (self.pat, self.pmt):                 # every file starts with PAT + PMT, then a keyframe
+        for p in (self.pat, self.pmt):                       # every file starts with PAT + PMT, then a keyframe
             if p:
-                self._write(p); self.cur_bytes += 188
+                self._write(bytearray(p))
 
     def _close(self):
         if not self.f:
@@ -275,8 +286,11 @@ class Splitter:
             except OSError: pass
 
     def finish(self):
+        for pid in list(self.held):
+            self._flush(pid)
         self._close()
 
+    # ---- tables ----
     def _pat(self, pk):
         self.pat = bytes(pk)
         p = 4 + ((1 + pk[4]) if (pk[3] >> 4) & 2 else 0)
@@ -294,130 +308,186 @@ class Splitter:
         p = 4 + ((1 + pk[4]) if (pk[3] >> 4) & 2 else 0)
         p += 1 + pk[p]
         sec = ((pk[p + 1] & 15) << 8) | pk[p + 2]
+        self.pcr = ((pk[p + 8] & 0x1f) << 8) | pk[p + 9]
         info = ((pk[p + 10] & 15) << 8) | pk[p + 11]
         q, end = p + 12 + info, min(p + 3 + sec - 4, 188)
         while q + 5 <= end:
-            if pk[q] in (0x1b, 0x24, 0x02, 0x10) and self.vid is None:
-                self.vid = ((pk[q + 1] & 31) << 8) | pk[q + 2]
-            elif pk[q] in (0x0f, 0x11, 0x03, 0x04, 0x81, 0x87):
-                self.aud.add(((pk[q + 1] & 31) << 8) | pk[q + 2])
+            st = pk[q]; pid = ((pk[q + 1] & 31) << 8) | pk[q + 2]
+            if st in ES_TYPES:
+                self.es.add(pid)
+                if st in VIDEO_TYPES:
+                    if self.vid is None:
+                        self.vid = pid
+                elif st != 0x06:
+                    self.aud.add(pid)
             q += 5 + (((pk[q + 3] & 15) << 8) | pk[q + 4])
+        self.allowed = {0, self.pmt_pid, self.pcr} | self.es   # everything else (other programs, EPG, ...) is left out
+
+    # ---- timeline ----
+    def _video_time(self, pts, dts, key):
+        raw = dts
+        if self.rebase_pending and key:
+            self._rebase(raw, pts); self.rebase_pending = False
+        elif self.last_raw_v is not None and not self.rebase_pending:
+            dd = (raw - self.last_raw_v) & MASK33
+            if dd >= 1 << 32:
+                dd -= 1 << 33
+            if dd < -90000 or dd > 900000:                    # time jumped inside one connection: continue smoothly
+                self._rebase(raw, pts)
+            elif 500 <= dd <= 20000:
+                self.fd = dd
+        self.last_raw_v = raw
+        self.last_out_v = (raw + self.off) & MASK33
+        self.last_pts = (pts + self.off) & MASK33
+        mx = self.last_pts
+        if self.max_out_pts is None or 0 < ((mx - self.max_out_pts) & MASK33) < 0x100000000:
+            self.max_out_pts = mx
+
+    def _rebase(self, raw, pts):
+        """Continue the time line right after the last picture: the new decode time follows the last decode time AND the new
+        display time is later than every picture shown so far, so the picture never stutters or steps back."""
+        if self.last_out_v is None:
+            return
+        off1 = (self.last_out_v + self.fd - raw) & MASK33
+        off2 = (self.max_out_pts + self.fd - pts) & MASK33 if self.max_out_pts is not None else off1
+        self.off = off2 if 0 <= ((off2 - off1) & MASK33) < 0x100000000 else off1
+        self.rebases += 1
 
     def _should_split(self):
-        # only: Split button, optional time limit, or the size limit. A reconnect / clock jump never splits a file.
         if self.want_split:
             self.want_split = False; self.manual_flag = True
             return True
         return (PART_MIN > 0 and self.media_secs() >= PART_MIN * 60) or self.cur_bytes >= PART_MAX
 
+    # ---- input ----
+    def _sync(self, buf):
+        n = len(buf)
+        for i in range(0, max(0, n - 188 * 2)):
+            if buf[i] == 0x47 and buf[i + 188] == 0x47 and buf[i + 376] == 0x47:
+                return i
+        return -1
+
     def feed(self, data):
-        self.buf += data
-        n = len(self.buf); i = 0
-        while i < n and self.buf[i] != 0x47:
-            i += 1
+        buf = self.buf + data
+        n = len(buf)
+        if not self.need_sync and buf and buf[0] != 0x47:
+            self.need_sync = True
+        i = 0
+        if self.need_sync:
+            if n < 188 * 3:
+                self.buf = buf; return
+            i = self._sync(buf)
+            if i < 0:
+                self.buf = buf[-188 * 3:]; return
+            self.need_sync = False
         end = i + ((n - i) // 188) * 188
-        buf = self.buf
         for o in range(i, end, 188):
-            pk = buf[o:o + 188]
-            pid = ((pk[1] & 0x1f) << 8) | pk[2]
-            if pid == 0x1fff:
-                continue                                  # drop empty padding packets
-            pusi = pk[1] & 0x40
-            key = False
-            is_es = pid == self.vid or pid in self.aud
-            pts, dts = pes_times(pk) if (pusi and is_es) else (None, None)
-            if self.skip is not None and is_es:          # after a reconnect: skip data we already have
-                if pusi:
-                    k = "v" if pid == self.vid else pid
-                    last = self.skip.get(k)
-                    fresh = False
-                    if last is None or dts is None:
-                        ahead = True
-                    else:
-                        d = sdiff(dts, last)
-                        ahead = d > 0 or d < -DUP_WINDOW   # newer than what we saved, or the server clock restarted
-                        if not ahead and pid == self.vid and self.verify:
-                            self.verify = False
-                            if not same_sig(vsig(pk), self.recent.get(dts)):
-                                fresh = True               # not a picture we saved: new content with a restarted clock
-                    if fresh:
-                        print("Server restarted its clock with NEW content: nothing is dropped, timeline is joined instead", flush=True)
-                        self.skip = None; self.dropping = set()
-                        self.need_key = True; self.need_key_until = time.time() + 20
-                    elif ahead:
-                        if pid == self.vid and last is not None and dts is not None:
-                            self.verify = False
-                            if not (0 < sdiff(dts, last) <= max(3 * self.fdur, 9000)):
-                                self.need_key = True; self.need_key_until = time.time() + 20   # not the very next picture: gap, wait for keyframe
-                        self.skip.pop(k, None); self.dropping.discard(pid)
-                        if not self.skip:
-                            self.skip = None
-                    else:
-                        self.dropping.add(pid)
-                if pid in self.dropping:
-                    self.drop_bytes += 188; self.deduped += 188
-                    if self.drop_bytes > 400_000_000:     # timestamps do not match: stop skipping, keep recording
-                        self.skip = None; self.dropping = set()
-                    continue
-            if self.need_key and is_es:
-                if pid == self.vid and pusi and (pk[3] >> 4) & 2 and pk[4] > 0 and (pk[5] & 0x40):
-                    self.need_key = False
-                elif time.time() > self.need_key_until:
-                    self.need_key = False
-                else:
-                    continue
-            if pid == 0 and pusi:
-                self._pat(pk)
-                if self.vid is None and self.pmt:
-                    key = True                            # audio-only stream: cut at PAT
-            elif pid == self.pmt_pid and pusi:
-                self._pmt(pk)
-            elif pid == self.vid and pusi:
-                if pts is not None:
-                    lastv = self.last_wr.get("v")
-                    if lastv is not None and self.skip is None:
-                        dd = sdiff(dts, lastv)
-                        if dd < -JUMP_BACK or dd > JUMP_FWD:
-                            # the server clock jumped (reconnect / restart): shift all following timestamps so the
-                            # picture continues one frame after the last one. Same file, no cut, no freeze.
-                            if self.last_out_v is not None:
-                                self.off = (self.last_out_v + self.fdur - dts) & M33
-                                self.rebased += 1
-                                print("Clock jump %+.1fs: timeline joined smoothly (join #%d)" % (dd / 90000.0, self.rebased), flush=True)
-                        elif 0 < dd <= 18000:
-                            self.fdur = dd                # normal picture spacing, used to place the first picture after a join
-                    self.last_pts = (pts + self.off) & M33
-                    self.last_out_v = (dts + self.off) & M33
-                    self.last_wr["v"] = dts               # raw value, used to skip repeated data after a reconnect
-                    self.recent[dts] = vsig(pk)
-                    if len(self.recent) > 3000:
-                        del self.recent[next(iter(self.recent))]
-                if (pk[3] >> 4) & 2 and pk[4] > 0 and (pk[5] & 0x40):
-                    key = True                            # random access indicator = keyframe starts here
-            elif pid in self.aud and pusi and dts is not None:
-                self.last_wr[pid] = dts
-            if self.f is None:
-                if (key or (self.vid is None and self.pmt and pid not in (0, self.pmt_pid))) and (self.pat and self.pmt):
-                    self._open()
-                else:
-                    continue
-            elif key and self._should_split():
-                self._close(); self._open()
-                if self.manual_flag:
-                    self.manual_flag = False
-                    if self.on_manual:
-                        self.on_manual(self.part_no)
-            if self.off and (pts is not None or ((pk[3] >> 4) & 2 and pk[4] >= 7 and pk[5] & 0x10)):
-                pk = shift_ts(pk, self.off)
-            self._write(pk); self.cur_bytes += 188
-            if is_es:
-                self.last_es = time.time()                # real video/audio data was saved (not just PAT/PMT)
+            self._packet(buf[o:o + 188])
         self.total += end - i
         self.buf = buf[end:]
-        now = time.time()
-        self.hist.append((now, self.total))
-        if len(self.hist) > 1500:
-            self.hist = [h for h in self.hist if now - h[0] <= 15]
+        self.hist.append((time.time(), self.total))
+
+    def _packet(self, pk):
+        pid = ((pk[1] & 0x1f) << 8) | pk[2]
+        if pid == 0x1fff:
+            return                                           # empty padding
+        if self.allowed is None:
+            if pid != 0 and pid != self.pmt_pid:
+                return
+        elif pid not in self.allowed:
+            return
+        pusi = pk[1] & 0x40
+        is_es = pid in self.es
+        keypk = bool(pid == self.vid and pusi and (pk[3] >> 4) & 2 and pk[4] > 0 and (pk[5] & 0x40))   # RAI flag = keyframe
+        pts = dts = None
+        if pusi and is_es:
+            pts, dts = pes_times(pk)
+        if self.skip is not None and is_es:                  # HLS replay after a reconnect: skip what we already have
+            if pusi:
+                k = "v" if pid == self.vid else pid
+                last = self.skip.get(k)
+                ahead = last is None or dts is None or 0 < ((dts - last) & MASK33) < 0x100000000
+                if ahead:
+                    self.skip.pop(k, None); self.dropping.discard(pid)
+                    if not self.skip:
+                        self.skip = None
+                else:
+                    self.dropping.add(pid)
+            if pid in self.dropping:
+                self.drop_bytes += 188; self.deduped += 188
+                if self.drop_bytes > 80_000_000:             # timestamps do not match: stop skipping, keep recording
+                    self.skip = None; self.dropping = set()
+                else:
+                    return
+        if self.need_key and is_es:
+            if keypk:
+                self.need_key = False
+            elif time.time() > self.need_key_until:
+                self.need_key = False
+            else:
+                return
+        if not is_es:                                        # PAT, PMT and PCR-only packets
+            key = False
+            if pid == 0:
+                if pusi:
+                    self._pat(pk)
+                    if self.vid is None and self.pmt:
+                        key = True                           # audio-only stream: cut at PAT
+            elif pid == self.pmt_pid:
+                if pusi:
+                    self._pmt(pk)
+            if key and self.f is None and self.pat and self.pmt:
+                self._open()
+            elif key and self.f is not None and self._should_split():
+                self._close(); self._open()
+            if self.f is not None:
+                b = bytearray(pk)
+                if self.off:
+                    shift_pcr(b, self.off)
+                self._write(b)
+            return
+        # ---- elementary stream packet (video / audio) ----
+        if pusi:
+            if pid == self.vid and dts is not None:
+                self._video_time(pts, dts, keypk)
+            elif pts is not None:                            # audio: never let time run backwards after a join
+                out = (pts + self.off) & MASK33
+                last = self.last_out_es.get(pid)
+                if last is not None:
+                    dd = (out - last) & MASK33
+                    if dd >= 1 << 32:
+                        dd -= 1 << 33
+                    if -90000 < dd <= 0:
+                        self._flush(pid)
+                        self.drop_pes.add(pid)               # this audio was already recorded: skip it
+                        return
+                self.last_out_es[pid] = out
+            self.drop_pes.discard(pid)
+            self._flush(pid)                                 # the previous picture/frame of this stream is complete now
+            if keypk:
+                if self.f is None:
+                    if self.pat and self.pmt:
+                        self._open()
+                elif self._should_split():
+                    self._close(); self._open()
+                    if self.manual_flag:
+                        self.manual_flag = False
+                        if self.on_manual:
+                            self.on_manual(self.part_no)
+            b = bytearray(pk)
+            if self.off:
+                if pts is not None:
+                    shift_pes(b, self.off)
+                shift_pcr(b, self.off)
+            self.held[pid] = [dts, [b]]
+        elif pid in self.drop_pes:
+            return
+        elif pid in self.held:
+            b = bytearray(pk)
+            if self.off:
+                shift_pcr(b, self.off)
+            self.held[pid][1].append(b)
+        # else: the start of this frame was never seen (after a reconnect): throw the piece away
 
 
 # ---------------- messages ----------------
@@ -442,9 +512,7 @@ def status_text():
         "⚡ <b>Speed</b>  %.1f Mbps" % spd + nxt,
     ]
     if S["restarts"]:
-        lines.append("♻️ <b>Reconnects</b>  %d  (files are NOT cut by reconnects)" % S["restarts"])
-        if S["reason"]:
-            lines.append("<code>%s</code>" % esc(S["reason"][:160]))
+        lines.append("📶 <b>Reconnects</b>  %s" % drop_line())
     if S["page"]:
         lines += ["", '📂 <a href="%s">Open the download page</a>' % S["page"]]
     return "\n".join(lines)
@@ -471,6 +539,7 @@ def do_action(act, cq_id=None):
 
 
 def halt():
+    S["stop_t"] = time.time()
     stop.set()
     p = S["proc"]
     if p and p.poll() is None:
@@ -516,7 +585,7 @@ def gofile_upload(path):
         print("[dry] would upload to gofile", path); return True, "https://gofile.io/d/DRYRUN", ""
     err = ""
     for attempt in range(6):
-        cmd = ["nice", "-n", "10", "curl", "-sS", "-m", "3600", "-F", "file=@" + path]   # low priority: never starve the recorder
+        cmd = ["curl", "-sS", "-m", "3600", "-F", "file=@" + path]
         if GF["folder"] and GF["token"]:
             cmd += ["-F", "folderId=" + GF["folder"], "-F", "token=" + GF["token"]]
         r = subprocess.run(cmd + [GOFILE_URL], capture_output=True, text=True)
@@ -553,7 +622,7 @@ def process(ts):
     os.makedirs(MP4_DIR, exist_ok=True)
     base = os.path.basename(ts)[:-3] + ".mp4"
     mp4 = os.path.join(MP4_DIR, base)
-    r = subprocess.run(["nice", "-n", "10", "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", ts, "-c", "copy", "-avoid_negative_ts", "make_zero", "-movflags", "+faststart", mp4],
+    r = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", ts, "-map", "0:v?", "-map", "0:a?", "-c", "copy", "-avoid_negative_ts", "make_zero", "-movflags", "+faststart", mp4],
                        capture_output=True, text=True)
     if r.returncode != 0 or not os.path.exists(mp4):
         mp4 = ts; base = os.path.basename(ts)
@@ -638,33 +707,52 @@ def probe_kind():
     return "hls" if ("hls" in names or "applehttp" in names) else "ts"
 
 
+def ff_hdr(d):
+    out = []
+    if d.get("User-Agent"):
+        out += ["-user_agent", d["User-Agent"]]
+    if d.get("Referer"):
+        out += ["-referer", d["Referer"]]
+    if d.get("Origin"):
+        out += ["-headers", "Origin: %s\r\n" % d["Origin"]]
+    return out
+
+
 def header_sets():
-    sets = []
+    """Browser / player like request headers to try. Some servers refuse requests that look like a script."""
+    own = _origin(URL)
+    refs = []
     if REFERER:
-        o = _origin(REFERER)
-        sets.append(("the referer you gave", ["-user_agent", UA, "-referer", REFERER] + (["-headers", "Origin: %s\r\n" % o] if o else [])))
-    sets.append(("a normal browser User-Agent", ["-user_agent", UA]))
-    o = _origin(URL)
-    if o:
-        sets.append(("browser headers with the stream's own site as referer", ["-user_agent", UA, "-referer", o + "/", "-headers", "Origin: %s\r\n" % o]))
+        refs.append(("the referer you gave", {"Referer": REFERER, "Origin": _origin(REFERER)}))
+    refs.append(("no referer", {}))
+    if own:
+        refs.append(("the stream's own site as referer", {"Referer": own + "/", "Origin": own}))
+    sets = []
+    for rl, rd in refs:
+        sets.append(("%s, %s" % ("your User-Agent" if E("UA") else "a normal browser", rl), dict(rd, **{"User-Agent": UA})))
     if kind_from_url() != "hls":
-        sets.append(("a VLC player User-Agent", ["-user_agent", "VLC/3.0.20 LibVLC/3.0.20"]))   # IPTV servers often expect a player
-        sets.append(("the default ffmpeg User-Agent", []))
+        for lab, ua in (("a VLC player", "VLC/3.0.20 LibVLC/3.0.20"), ("ExoPlayer", "ExoPlayerLib/2.18.7"),
+                        ("okhttp (many Android IPTV players)", "okhttp/4.9.3"), ("the default ffmpeg", None)):
+            sets.append((lab, {"User-Agent": ua} if ua else {}))
     return sets
 
 
 def precheck():
-    global HDR
+    global HDR, REQ_HDR, KIND
     last = ""
-    for label, hdr in header_sets():
+    for label, d in header_sets():
+        hdr = ff_hdr(d)
         try:
             r = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error"] + hdr + ["-t", "6", "-i", URL, "-f", "null", "-"],
-                               capture_output=True, text=True, timeout=90)
+                               capture_output=True, text=True, timeout=40)
         except Exception as e:
             last = str(e); continue
         if r.returncode == 0:
             HDR = hdr
-            global KIND
+            REQ_HDR = {"Accept": "*/*", "Accept-Encoding": "identity", "Connection": "keep-alive", "User-Agent": d.get("User-Agent") or "Lavf/60.16.100"}
+            for k in ("Referer", "Origin"):
+                if d.get(k):
+                    REQ_HDR[k] = d[k]
             KIND = kind_from_url()
             if KIND == "?":
                 KIND = probe_kind()
@@ -746,6 +834,96 @@ def stderr_reader(p, box):
         del box[:-30]
 
 
+def drop_line():
+    d = S["drops"]
+    if not d:
+        return "0"
+    alive = sum(x["alive"] for x in d) / len(d)
+    return "%d  ·  a connection lasts ~%s  ·  ~%d s lost in total" % (len(d), mmss(alive), S["gap_total"])
+
+
+def drop_reasons():
+    cnt = {}
+    for x in S["drops"]:
+        cnt[x["reason"]] = cnt.get(x["reason"], 0) + 1
+    return ", ".join("%s ×%d" % (k, v) for k, v in sorted(cnt.items(), key=lambda kv: -kv[1])[:3])
+
+
+def ts_source(q):
+    """Reads a direct MPEG-TS link with plain HTTP. No ffmpeg start-up, so a dropped connection is re-opened within a second."""
+    ctx = None; attempt = 0
+    while not stop.is_set():
+        t0 = time.time(); got = 0; reason = "server closed the connection"; r = None
+        try:
+            req = urllib.request.Request(URL, headers=REQ_HDR)
+            try:
+                r = urllib.request.urlopen(req, timeout=20, context=ctx)
+            except urllib.error.URLError as e:
+                if isinstance(getattr(e, "reason", None), ssl.SSLError):
+                    ctx = ssl._create_unverified_context()
+                    r = urllib.request.urlopen(req, timeout=20, context=ctx)
+                else:
+                    raise
+            if getattr(r, "status", 200) != 200:
+                raise IOError("HTTP %s" % r.status)
+            while not stop.is_set():
+                d = r.read1(65536)
+                if not d:
+                    break
+                got += len(d)
+                q.put(("data", d))
+        except urllib.error.HTTPError as e:
+            reason = "HTTP %d" % e.code
+        except Exception as e:
+            reason = "timeout (no data for 20 s)" if "timed out" in str(e).lower() else ("%s %s" % (type(e).__name__, str(e)[:60])).strip()
+        try:
+            if r is not None:
+                r.close()
+        except Exception:
+            pass
+        if stop.is_set():
+            break
+        q.put(("drop", reason, time.time() - t0, got))
+        if got > 100000:
+            attempt = 0
+            delay = 0.2                                      # it was a good connection: try again at once
+        else:
+            attempt += 1
+            delay = min(10.0, 0.5 * attempt)
+        stop.wait(delay)
+    S["src_done"].set()
+
+
+def ffmpeg_source(q):
+    """HLS: ffmpeg reads the playlist; every restart looks back over the whole playlist, repeated data is skipped."""
+    first = True
+    while not stop.is_set():
+        inopts = ["-fflags", "+discardcorrupt+genpts", "-rw_timeout", "60000000", "-reconnect", "1", "-reconnect_streamed", "1",
+                  "-reconnect_delay_max", "15", "-seg_max_retry", "15", "-max_reload", "1000", "-m3u8_hold_counters", "1000",
+                  "-http_persistent", "0", "-live_start_index", ("-" + BACK) if first else "-10"]
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-y"] + inopts + HDR + [
+               "-i", URL, "-map", "0:v?", "-map", "0:a?", "-c", "copy", "-copyts", "-muxdelay", "0", "-muxpreload", "0",
+               "-f", "mpegts", "-mpegts_flags", "+resend_headers", "pipe:1"]
+        first = False
+        t0 = time.time(); got = 0
+        p = S["proc"] = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
+        last_err = []
+        threading.Thread(target=stderr_reader, args=(p, last_err), daemon=True).start()
+        while True:
+            data = p.stdout.read(188 * 1024)
+            if not data:
+                break
+            got += len(data)
+            q.put(("data", data))
+        p.wait()
+        if stop.is_set() or TEST_ONCE:
+            break
+        q.put(("drop", why_exit(p.returncode, last_err)[:90], time.time() - t0, got))
+        stop.wait(1.0)
+    q.put(("end",))
+    S["src_done"].set()
+
+
 def record():
     global SP
     os.makedirs(OUT, exist_ok=True)
@@ -781,26 +959,6 @@ def record():
     SP.on_manual = lambda n: say("✂️ <b>Split done</b>\nFile #%d started. Recording continues." % n, buttons=True)
     end_at = S["t0"] + (min(total, LIMIT) if total else LIMIT)
 
-    # The reader (below) only moves bytes from ffmpeg into this queue. The splitter works on the other side.
-    # So a slow disk, a busy CPU or an upload can never make the pipe full and the server drop the connection.
-    rq = queue.Queue(maxsize=4000)
-
-    def consumer():
-        while True:
-            it = rq.get()
-            if it is None:
-                return
-            try:
-                if it[0] == "d":
-                    SP.feed(it[1])
-                else:
-                    SP.new_session(dedupe=it[1], verify=it[2])
-            except Exception as e:
-                print("splitter error:", repr(e), flush=True)
-                SP.buf = b""
-    ct = threading.Thread(target=consumer)
-    ct.start()
-
     def watchdog():
         while not stop.is_set():
             if time.time() >= end_at:
@@ -824,45 +982,29 @@ def record():
             time.sleep(5)
     threading.Thread(target=stream_monitor, daemon=True).start()
 
-    last_err = []; first = True; consec = 0
-    while not stop.is_set():
-        if KIND == "ts":
-            # no ffmpeg-internal reconnect: after a drop a NEW ffmpeg starts quickly (small probe), and the splitter
-            # joins the timeline, so a restarted server clock does not matter
-            inopts = ["-fflags", "+discardcorrupt+genpts", "-rw_timeout", "20000000",
-                      "-probesize", "2000000", "-analyzeduration", "1500000"]
-        else:
-            inopts = ["-fflags", "+discardcorrupt+genpts", "-rw_timeout", "60000000", "-reconnect", "1", "-reconnect_streamed", "1",
-                      "-reconnect_delay_max", "15", "-seg_max_retry", "15", "-max_reload", "1000", "-m3u8_hold_counters", "1000",
-                      "-http_persistent", "0", "-live_start_index", ("-" + BACK) if first else ("-" + RECON_BACK)]
-        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-y"] + inopts + HDR + [
-               "-i", URL, "-map", "0:v?", "-map", "0:a?", "-c", "copy", "-copyts", "-muxdelay", "0", "-muxpreload", "0",
-               "-f", "mpegts", "-mpegts_flags", "+resend_headers", "pipe:1"]
-        first = False
-        t_run = time.time()
-        p = S["proc"] = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
-        if fcntl:
-            try: fcntl.fcntl(p.stdout.fileno(), 1031, 1 << 20)       # F_SETPIPE_SZ: 1 MB pipe
-            except Exception: pass
-        last_err = []
-        threading.Thread(target=stderr_reader, args=(p, last_err), daemon=True).start()
-        while True:
-            data = p.stdout.read(1 << 20)
-            if not data:
+    q = queue.Queue(maxsize=4000)                      # a big buffer: slow disk/CPU never makes the server drop us
+    threading.Thread(target=(ts_source if KIND == "ts" else ffmpeg_source), args=(q,), daemon=True).start()
+    t_drop = None
+    while True:
+        try:
+            item = q.get(timeout=1)
+        except queue.Empty:
+            if stop.is_set() and (S["src_done"].is_set() or time.time() - S["stop_t"] > 8):
                 break
-            rq.put(("d", data)); S["last_data"] = time.time()
-            S["qmax"] = max(S["qmax"], rq.qsize())
-        p.wait()
-        if stop.is_set() or TEST_ONCE:
+            continue
+        kind = item[0]
+        if kind == "data":
+            if t_drop is not None:
+                S["gap_total"] += time.time() - t_drop; t_drop = None
+            SP.feed(item[1]); S["last_data"] = time.time()
+        elif kind == "drop":
+            S["restarts"] += 1
+            S["drops"].append({"t": time.time(), "reason": item[1], "alive": item[2], "got": item[3]})
+            SP.new_session(dedupe=(KIND != "ts"))         # same file continues, the picture is joined smoothly
+            t_drop = time.time()
+            print("Reconnect %d after %s (%s)" % (S["restarts"], mmss(item[2]), item[1]), flush=True)   # log only
+        else:
             break
-        S["restarts"] += 1
-        rq.put(("n", True, KIND == "ts"))                    # processed in order, after the data already queued
-        S["reason"] = why_exit(p.returncode, last_err)
-        consec = 0 if time.time() - t_run > 30 else consec + 1
-        print("Reconnect %d (queue peak %d): %s" % (S["restarts"], S["qmax"], S["reason"]), flush=True)   # log only, no Telegram spam
-        time.sleep(min(0.5 + 0.5 * consec, 5))
-    rq.put(None)
-    ct.join()
     SP.finish()
     upq.put(None)
     up.join()
@@ -870,8 +1012,9 @@ def record():
     page = S["page"]
     summary("## Recording finished\n%d file(s), %s. %s" % (len(S["done"]), human(saved), ("[Download page](%s)" % page) if page else ""))
     rows = "\n".join("%d.  %s  ·  %s" % (i + 1, human(d["size"]), mmss(d["secs"])) for i, d in enumerate(S["done"][:30]))
-    say("🏁 <b>Recording finished</b>\n🎬 %s\n📁 %d file(s)  ·  %s\n⏱ %s\n\n%s%s" %
-        (esc(NAME), len(S["done"]), human(saved), hms(time.time() - S["t0"]), rows,
+    rec_line = ("\n\n📶 Reconnects: %s\n<i>%s</i>" % (drop_line(), esc(drop_reasons()))) if S["drops"] else ""
+    say("🏁 <b>Recording finished</b>\n🎬 %s\n📁 %d file(s)  ·  %s\n⏱ %s\n\n%s%s%s" %
+        (esc(NAME), len(S["done"]), human(saved), hms(time.time() - S["t0"]), rows, rec_line,
          ('\n\n📂 <a href="%s">Download all files (one page)</a>' % page) if page else "\n\n⚠️ No file could be uploaded. See the run log."))
 
 
