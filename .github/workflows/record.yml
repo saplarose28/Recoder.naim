@@ -33,6 +33,10 @@ on:
         description: "Optional: website the link is played on (only if the link needs it)"
         required: false
         default: ""
+      user_agent:
+        description: "Optional: player name the link expects (leave empty unless the link only works in a certain player)"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -43,7 +47,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 355
     env:
-      PYTHONUNBUFFERED: "1"
       TG_TOKEN: ${{ secrets.TG_TOKEN }}
       TG_CHAT: ${{ secrets.TG_CHAT }}
       GH_TOKEN: ${{ github.token }}
@@ -57,6 +60,7 @@ jobs:
       PART_MB: ${{ inputs.part_mb }}
       PART_MIN: ${{ inputs.part_min }}
       REFERER: ${{ inputs.referer }}
+      UA: ${{ inputs.user_agent }}
       OUT_DIR: /mnt/rec
       MP4_DIR: rec_mp4
     steps:
