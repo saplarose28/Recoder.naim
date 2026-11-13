@@ -20,17 +20,14 @@ on:
           - hls
           - ts
         default: auto
-      quality:
-        description: "Quality when the link is a master playlist: best / mid / low (use low if the source is slow)"
+      mode:
+        description: "auto (finds out itself), live (a running stream) or archive (a finished timeshift / catch-up .ts or .m3u8 file: it is downloaded completely, then it stops)"
         type: choice
         options:
-          - best
-          - mid
-          - low
-        default: mid
-      workers:
-        description: "Parallel segment downloads"
-        default: "10"
+          - auto
+          - live
+          - archive
+        default: auto
       name:
         description: "File name"
         default: "ClipByNaim"
@@ -42,6 +39,18 @@ on:
         default: "0"
       referer:
         description: "Optional: website the link is played on (only if the link needs it)"
+        required: false
+        default: ""
+      ticket:
+        description: "Set by the Telegram worker (the stream link is kept there, not on GitHub). Leave empty when you start it by hand."
+        required: false
+        default: ""
+      chat:
+        description: "Set by the Telegram worker: the chat that gets the messages. Empty = your own chat (secret TG_CHAT)."
+        required: false
+        default: ""
+      also:
+        description: "Set by the Telegram worker: extra chat ids that get a copy of the messages (the owner)."
         required: false
         default: ""
 
@@ -56,7 +65,11 @@ jobs:
     env:
       PYTHONUNBUFFERED: "1"
       TG_TOKEN: ${{ secrets.TG_TOKEN }}
-      TG_CHAT: ${{ secrets.TG_CHAT }}
+      TG_CHAT: ${{ inputs.chat || secrets.TG_CHAT }}
+      TG_ALSO: ${{ inputs.also }}
+      TICKET: ${{ inputs.ticket }}
+      WORKER_URL: ${{ secrets.WORKER_URL }}
+      WORKER_KEY: ${{ secrets.WORKER_KEY }}
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
       RUN_ID: ${{ github.run_id }}
@@ -64,18 +77,47 @@ jobs:
       MINUTES: ${{ inputs.minutes }}
       IDLE_STOP_MIN: ${{ inputs.idle_min }}
       STREAM_TYPE: ${{ inputs.stream_type }}
-      QUALITY: ${{ inputs.quality }}
-      WORKERS: ${{ inputs.workers }}
+      MODE: ${{ inputs.mode }}
       NAME: ${{ inputs.name }}
       PART_MB: ${{ inputs.part_mb }}
       PART_MIN: ${{ inputs.part_min }}
       REFERER: ${{ inputs.referer }}
+      PROXY: ${{ secrets.PROXY }}
       OUT_DIR: /mnt/rec
       MP4_DIR: rec_mp4
     steps:
-      - uses: actions/checkout@v4
-      - name: Install ffmpeg
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+      - uses: actions/checkout@v6
+      - name: Install ffmpeg (latest)
+        timeout-minutes: 12
+        run: |
+          # The newest ffmpeg is downloaded straight from GitHub (fast, no apt mirror needed). apt is only the backup.
+          export DEBIAN_FRONTEND=noninteractive
+          have() { command -v ffmpeg >/dev/null 2>&1 && command -v ffprobe >/dev/null 2>&1; }
+          if have; then echo "ffmpeg already installed"; ffmpeg -version | head -1; exit 0; fi
+          echo "== try 1: newest build from GitHub"
+          mkdir -p /tmp/ff && cd /tmp/ff
+          curl -fsSL --retry 3 --connect-timeout 20 --max-time 200 -o ff.tar.xz \
+            https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz \
+            && tar xf ff.tar.xz --strip-components=1 \
+            && sudo cp bin/ffmpeg bin/ffprobe /usr/local/bin/ || true
+          cd - >/dev/null
+          if ! have; then
+            echo "== try 2: apt (switching the Azure mirror that fails to the main Ubuntu one)"
+            sudo sed -i 's|azure.archive.ubuntu.com|archive.ubuntu.com|g' /etc/apt/apt-mirrors.txt 2>/dev/null || true
+            APT="-o Acquire::Retries=1 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15"
+            sudo timeout -k 5 60 apt-get $APT update -qq || true
+            sudo timeout -k 5 120 apt-get $APT install -y -qq --no-install-recommends ffmpeg || true
+          fi
+          if ! have; then
+            echo "== try 3: static build"
+            mkdir -p /tmp/ff2 && cd /tmp/ff2
+            curl -fsSL --retry 3 --connect-timeout 20 --max-time 150 -o ff.tar.xz \
+              https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz \
+              && tar xf ff.tar.xz --strip-components=1 \
+              && sudo cp ffmpeg ffprobe /usr/local/bin/ || true
+            cd - >/dev/null
+          fi
+          if have; then ffmpeg -version | head -1; else echo "::error title=ffmpeg could not be installed::All 3 ways failed. Press Re-run jobs once more."; exit 1; fi
       - name: Use the second disk for recording
         run: sudo mkdir -p /mnt/rec && sudo chown "$USER" /mnt/rec
       - name: Record
